@@ -1,0 +1,764 @@
+#!/usr/bin/python3
+
+# Copyright (C) 2026  Vincent Pelletier <plr.vincent@gmail.com>
+#
+# This file is part of atone.
+# atone is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# atone is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with atone.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+from collections import defaultdict
+import datetime
+from email.message import EmailMessage
+from email.parser import Parser
+import email.policy
+import email.utils
+import enum
+import getpass
+import io
+import json
+import os
+import struct
+from urllib.parse import urljoin, urlencode
+from urllib.request import urlopen, Request
+
+BILE_MAGIC = b'BILE2'
+BILE_MAGIC_LEN = 5
+BILE_TYPE_MAP = b'_BLM'
+BILE_TYPE_MAPPTR = b'_BL>'
+BILE_TYPE_PURGE = b'_BLP'
+BILE_TYPE_HIGHESTID = b'_BLH'
+
+BILE_OBJECT_SIZE = 16
+BILE_HEADER_LEN = 256
+BILE_ALLOCATE_SIZE = 8192
+
+AMEND_CREATOR = 'AMND'
+REPO_TYPE = 'AMRP'
+REPO_FILE_RTYPE = 'AFIL'
+REPO_AMENDMENT_RTYPE = 'CMMT'
+REPO_DIFF_RTYPE = 'DIFF'
+REPO_TEXT_RTYPE = 'TEXT'
+REPO_VERS_RTYPE = 'RVER'
+DIFF_FILE_TYPE = 'TEXT'
+REPO_CUR_VERS = 3
+
+class RepoFileFlags(enum.IntFlag):
+    DELETED = 1 << 0
+
+REPO_FILE_ATTRS_SIZE = 17
+
+class DiffedFileFlags(enum.IntFlag):
+    DIFFED_FILE_TEXT = 1 << 0
+    DIFFED_FILE_METADATA = 1 << 1
+
+_patch_email_policy = email.policy.default.clone(
+    max_line_length=None,
+    linesep='\n',
+    cte_type='8bit',
+    utf8=True,
+)
+
+_EPOCH = datetime.datetime(1904, 1, 1, tzinfo=datetime.timezone.utc)
+def _decode_time(value):
+    return _EPOCH + datetime.timedelta(seconds=value)
+
+def _encode_time(value):
+    return int((value - _EPOCH).total_seconds())
+
+class Repo:
+    def __init__(self, path, encoding):
+        # XXX: should encoding be stored in the repo file (see Script.h doc) ?
+        self._encoding = encoding
+        self._path = path
+        self._max_id_dict = max_id_dict = defaultdict(int)
+        self._file_dict = file_dict = {}
+        self._file_by_name_dict = file_by_name_dict = {}
+        self._amendment_list = amendment_list = []
+        with open(path, 'rb') as repofile:
+            read = repofile.read
+            seek = repofile.seek
+            def read_bile_object():
+                result = {}
+                (
+                    result['pos'],
+                    result['size'],
+                    result['type'],
+                    result['id'],
+                ) = struct.unpack('>II4sI', read(BILE_OBJECT_SIZE))
+                return result
+            magic = read(BILE_MAGIC_LEN)
+            if magic != BILE_MAGIC:
+                raise ValueError(f'Unexpected magic: %{magic!r}')
+            map_ptr = read_bile_object()
+            # XXX: repo files have BILE_TYPE_MAP as their map pointer type, and not BILE_TYPE_MAPPTR
+            #assert map_ptr.type == BILE_TYPE_MAPPTR, map_ptr.type
+            # TODO: add support for loading from old map
+            map_by_type = defaultdict(dict)
+            if map_ptr['size']:
+                map_entry_count, remainder = divmod(
+                    map_ptr['size'],
+                    BILE_OBJECT_SIZE,
+                )
+                assert remainder == 0, map_ptr['size']
+                seek(map_ptr['pos'])
+                target = read_bile_object()
+                assert target['pos']  == map_ptr['pos'],  (
+                    target['pos'],  map_ptr['pos'],
+                )
+                assert target['size'] == map_ptr['size'], (
+                    target['size'], map_ptr['size'],
+                )
+                assert target['type'] == BILE_TYPE_MAP, target['type']
+                for _ in range(map_entry_count):
+                    entry = read_bile_object()
+                    entry_type = entry['type'].decode(encoding)
+                    map_by_id = map_by_type[entry_type]
+                    entry_id = entry['id']
+                    assert entry_id not in map_by_id, (
+                        entry, map_by_id[entry_id],
+                    )
+                    map_by_id[entry_id] = entry
+                    if entry_id > max_id_dict[entry_type]:
+                        max_id_dict[entry_type] = entry_id
+            for entry_id, entry in map_by_type[REPO_FILE_RTYPE].items():
+                assert entry_id not in file_dict
+                seek(entry['pos'] + BILE_OBJECT_SIZE)
+                filename_length = ord(read(1))
+                assert filename_length + 18 == entry['size'], (
+                    filename_length, entry['size'],
+                )
+                filename = read(filename_length).decode(encoding)
+                assert filename not in file_by_name_dict, (
+                    filename, file_by_name_dict[filename],
+                )
+                (
+                    file_type,
+                    file_creator,
+                    file_ctime,
+                    file_mtime,
+                    file_flags,
+                ) = struct.unpack('>4s4sIIB', read(17))
+                body_entry = map_by_type[REPO_TEXT_RTYPE][entry_id]
+                seek(body_entry['pos'] + BILE_OBJECT_SIZE)
+                file_by_name_dict[filename] = file_dict[entry['id']] = {
+                    'id': entry_id,
+                    'name': filename,
+                    'type': file_type.decode(encoding),
+                    'creator': file_creator.decode(encoding),
+                    'ctime': _decode_time(file_ctime),
+                    'mtime': _decode_time(file_mtime),
+                    'flags': RepoFileFlags(file_flags),
+                    'body': read(body_entry['size']).decode(encoding),
+                }
+            for amendment_id, entry in map_by_type[
+                REPO_AMENDMENT_RTYPE
+            ].items():
+                seek(entry['pos'] + BILE_OBJECT_SIZE)
+                amendment_entry = {
+                    'date': _decode_time(
+                        struct.unpack('>I', read(4))[0],
+                    ),
+                }
+                amendment_entry['author'] = read(ord(read(1))).decode(encoding)
+                amendment_entry['file_id_list'] = [
+                    struct.unpack('>H', read(2))[0]
+                    for _ in range(struct.unpack('>H', read(2))[0])
+                ]
+                (
+                    amendment_entry['adds'],
+                    amendment_entry['subs'],
+                ) = struct.unpack('>HH', read(4))
+                amendment_entry['message'] = read(
+                    struct.unpack('>H', read(2))[0],
+                ).decode(encoding)
+                diff_entry = map_by_type[REPO_DIFF_RTYPE][amendment_id]
+                seek(diff_entry['pos'] + BILE_OBJECT_SIZE)
+                amendment_entry['diff'] = read(
+                    diff_entry['size'],
+                ).decode(encoding)
+                amendment_list.append(amendment_entry)
+
+    @classmethod
+    def init(cls, path, encoding):
+        with open(path, 'xb') as outfile:
+            write = outfile.write
+            write(BILE_MAGIC)
+            write(struct.pack('>II4sI', 0, 0, BILE_TYPE_MAPPTR, 0))
+            write(struct.pack('>II4sI', 0, 0, b'\x00\x00\x00\x00', 0))
+            write(b'\x00' * (
+              BILE_HEADER_LEN - BILE_MAGIC_LEN - BILE_OBJECT_SIZE * 2
+            ))
+            assert outfile.tell() == BILE_HEADER_LEN
+        return cls(path, encoding)
+
+    @classmethod
+    def clone_from(cls, url, to_path, encoding):
+        receive_buffer = bytearray(1024 * 1024)
+        with open(to_path, 'xb') as outfile:
+            with urlopen(
+                Request(
+                    url=urljoin(url + '/', 'download'),
+                    data=urlencode({'format': 'Amend'}).encode('ascii'),
+                    headers={
+                        'User-Agent': 'pyamend',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Accept': '*/*',
+                    },
+                    unverifiable=True,
+                ),
+            ) as response:
+                assert response.status == 200
+                while True:
+                    received = response.readinto(receive_buffer)
+                    if not received:
+                        break
+                    outfile.write(receive_buffer[:received])
+        return cls(to_path, encoding)
+
+    def get_amendment_count(self):
+        return len(self._amendment_list)
+
+    def get_amendment(self, index):
+        assert index > 0, index
+        amendment = self._amendment_list[index]
+        return {
+            x: amendment[x]
+            for x in (
+                'author',
+                'date',
+                'message',
+            )
+        }
+
+    def save(self, save_as=None, encoding=None):
+        if encoding is None:
+            encoding = self._encoding
+        if save_as is None:
+            save_as = self._path
+        temp_filename = save_as + '.tmp'
+        try:
+            with open(temp_filename, 'xb') as repofile:
+                write = repofile.write
+                tell = repofile.tell
+                write(b'\x00' * BILE_HEADER_LEN)
+                map_list = []
+                def write_entry(entry_id, entry_type, entry_body):
+                    entry = struct.pack(
+                        '>II4sI',
+                        tell(),
+                        len(entry_body),
+                        entry_type.encode(encoding),
+                        entry_id,
+                    )
+                    map_list.append(entry)
+                    write(entry)
+                    write(entry_body)
+                write_entry(
+                    entry_id=1,
+                    entry_type=REPO_VERS_RTYPE,
+                    entry_body=struct.pack('>B', REPO_CUR_VERS),
+                )
+                for file_id, file in self._file_dict.items():
+                    assert file_id == file['id'], (file_id, file)
+                    file_name = file['name'].encode(encoding)
+                    write_entry(
+                        entry_id=file_id,
+                        entry_type=REPO_FILE_RTYPE,
+                        entry_body=(
+                            struct.pack('>B', len(file_name)) +
+                            file_name +
+                            struct.pack(
+                                '>4s4sIIB',
+                                file['type'].encode(encoding),
+                                file['creator'].encode(encoding),
+                                _encode_time(file['ctime']),
+                                _encode_time(file['mtime']),
+                                file['flags'],
+                            )
+                        ),
+                    )
+                    write_entry(
+                        entry_id=file_id,
+                        entry_type=REPO_TEXT_RTYPE,
+                        entry_body=(
+                            b''
+                            if file['flags'] & RepoFileFlags.DELETED else
+                            file['body'].encode(encoding)
+                        ),
+                    )
+                for amendment_id, amendment in enumerate(self._amendment_list, 1):
+                    author = amendment['author'].encode(encoding)
+                    message = amendment['message'].encode(encoding)
+                    write_entry(
+                        entry_id=amendment_id,
+                        entry_type=REPO_AMENDMENT_RTYPE,
+                        entry_body=(
+                            struct.pack(
+                                '>IB',
+                                _encode_time(amendment['date']),
+                                len(author),
+                            ) +
+                            author +
+                            struct.pack('>H', len(amendment['file_id_list'])) +
+                            b''.join(
+                                struct.pack('>H', x)
+                                for x in amendment['file_id_list']
+                            ) +
+                            struct.pack(
+                                '>HHH',
+                                amendment['adds'],
+                                amendment['subs'],
+                                len(message),
+                            ) + message
+                        )
+                    )
+                    write_entry(
+                        entry_id=amendment_id,
+                        entry_type=REPO_DIFF_RTYPE,
+                        entry_body=amendment['diff'].encode(encoding),
+                    )
+                map_pos = tell()
+                write(struct.pack(
+                    '>II4sI',
+                    map_pos,
+                    len(map_list) * BILE_OBJECT_SIZE,
+                    BILE_TYPE_MAP,
+                    0,
+                ))
+                for map_entry in map_list:
+                    write(map_entry)
+                repofile.seek(0)
+                write(BILE_MAGIC)
+                write(struct.pack(
+                    '>II4sI',
+                    map_pos,
+                    len(map_list) * BILE_OBJECT_SIZE,
+                    BILE_TYPE_MAPPTR,
+                    0,
+                ))
+        except BaseException:
+            os.unlink(temp_filename)
+            raise
+        os.rename(temp_filename, save_as)
+
+    def format_patch(self, revision):
+        file_dict = self._file_dict
+        amendment = self._amendment_list[revision]
+        result = EmailMessage(policy=_patch_email_policy)
+        result.set_charset('utf-8')
+        result.set_unixfrom(f'From {revision} Mon Sep 17 00:00:00 2001')
+        result.add_header('From', amendment['author'] + ' <nobody@localhost>')
+        result.add_header('Date', email.utils.format_datetime(
+            amendment['date'],
+        ))
+        commit_message = amendment['message'].splitlines()
+        result.add_header('Subject', '[PATCH] ' + commit_message[0])
+        body = io.StringIO()
+        if len(commit_message) > 1:
+            for line in commit_message[1:]:
+                print(line, file=body)
+            print(file=body)
+        for file_id in amendment['file_id_list']:
+            file_info = file_dict[file_id]
+            print('atone:', json.dumps({
+                'name': file_info['name'],
+                'type': file_info['type'],
+                'creator': file_info['creator'],
+            }), file=body)
+        print(file=body)
+        print(file=body)
+        for line in amendment['diff'].splitlines():
+            print(line, file=body)
+        result.set_content(body.getvalue())
+        return result.as_bytes(unixfrom=True)
+
+    def am(
+        self,
+        working_copy_path, # XXX: get rid of this by applying the patches as they are processed
+        patch_filename_list,
+        default_author=None,
+        author_dict=(),
+        default_file_type='TEXT',
+        default_file_creator='ttxt',
+    ):
+        modified_file_set = set()
+        for patch_filename in patch_filename_list:
+            self._am(
+                modified_file_set=modified_file_set,
+                patch_filename=patch_filename,
+                default_author=default_author,
+                author_dict=dict(author_dict),
+                default_file_type=default_file_type,
+                default_file_creator=default_file_creator,
+            )
+        file_by_name_dict = self._file_by_name_dict
+        for file_name in modified_file_set:
+            with open(
+                os.path.join(working_copy_path, file_name),
+                'r',
+                encoding='utf-8',
+            ) as text_file:
+                file_by_name_dict[file_name]['body'] = '\r'.join(
+                    text_file.read().splitlines(),
+                )
+
+    def _am(
+        self,
+        modified_file_set,
+        patch_filename,
+        default_author, author_dict,
+        default_file_type, default_file_creator,
+    ):
+        file_dict = self._file_dict
+        file_by_name_dict = self._file_by_name_dict
+        max_id_dict = self._max_id_dict
+        with open(patch_filename, 'r', encoding='utf-8') as patch_file:
+            patch_email = Parser(policy=_patch_email_policy).parse(
+                patch_file,
+            )
+        patch_email.set_charset('utf-8')
+        email_from = patch_email['From']
+        try:
+            author = author_dict[email_from]
+        except KeyError:
+            email_from_realname, email_from_address = email.utils.parseaddr(
+                email_from,
+            )
+            try:
+                author = author_dict[email_from_address]
+            except KeyError:
+                author = author_dict.get(email_from_realname, default_author)
+        file_id_set = set()
+        added_line_count = 0
+        removed_line_count = 0
+        subject = patch_email['Subject']
+        if subject.startswith('['):
+            # XXX: assume '[...] first line', extracts 'first line'
+            subject = subject.split(']', 1)[1][1:]
+        message_line_list = [subject]
+        file_attr_dict = {}
+        commit_date = email.utils.parsedate_to_datetime(patch_email['Date'])
+        patch = []
+        next_line = iter(patch_email.get_content().splitlines()).__next__
+        # Read commit message
+        while True:
+            line = next_line()
+            if line.startswith('atone: '):
+                try:
+                    file_attribute = json.loads(line[7:])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    file_attr_dict[file_attribute['name']] = {
+                        'type': file_attribute['type'],
+                        'creator': file_attribute['creator'],
+                    }
+                    continue
+            if line.startswith('---'):
+                # May mark the beginning of a diff or of commit stats
+                break
+            if len(message_line_list) == 1:
+                message_line_list.append('')
+            message_line_list.append(line)
+        # Skip commit stats, if any
+        while not line.startswith('--- '):
+            line = next_line()
+        # Read patch, checking file names as we go
+        while line != '-- ':
+            patch.append(line)
+            if line.startswith('--- '):
+                filename_a = line[4:].split('\t', 1)[0]
+                line = next_line()
+                patch.append(line)
+                assert line.startswith('+++ ')
+                filename_b = line[4:].split('\t', 1)[0]
+                if (
+                    filename_a.startswith('a/') and
+                    filename_b.startswith('b/')
+                ):
+                    filename_a = filename_a[2:]
+                    filename_b = filename_b[2:]
+                if filename_a == '/dev/null':
+                    filename_a = None
+                else:
+                    assert '/' not in filename_a, filename_a
+                if filename_b == '/dev/null':
+                    filename_b = None
+                else:
+                    assert '/' not in filename_b, filename_b
+                assert filename_a is not None or filename_b is not None
+                if filename_b is None:
+                    # Delete filename_a
+                    file_dict[filename_a]['flags'] |= RepoFileFlags.DELETED
+                    modified_file_set.discard(filename_a)
+                else:
+                    file_entry = file_by_name_dict.get(filename_b, {})
+                    if filename_a is None or filename_a != filename_b:
+                        # Create filename_b
+                        if file_entry:
+                            assert file_entry[
+                                'flags'
+                            ] & RepoFileFlags.DELETED, filename_b
+                            file_entry['flags'] &= ~RepoFileFlags.DELETED
+                        else:
+                            file_entry['flags'] = RepoFileFlags(0)
+                            file_entry['id'] = file_entry_id = max_id_dict[
+                                REPO_TEXT_RTYPE
+                            ] = max_id_dict[REPO_TEXT_RTYPE] + 1
+                            file_by_name_dict[filename_b] = file_dict[
+                                file_entry_id
+                            ] = file_entry
+                        file_entry_attr_dict = file_attr_dict.get(
+                            filename_b,
+                            {},
+                        )
+                        file_entry['type'] = file_entry_attr_dict.get(
+                            'type',
+                            default_file_type,
+                        )
+                        file_entry['creator'] = file_entry_attr_dict.get(
+                            'creator',
+                            default_file_creator,
+                        )
+                        file_entry['ctime'] = commit_date
+                    file_entry['mtime'] = commit_date
+                    modified_file_set.add(filename_b)
+                    file_id = file_entry['id']
+                    assert file_id not in file_id_set, filename_b
+                    file_id_set.add(file_id)
+            elif line.startswith('-'):
+                removed_line_count += 1
+            elif line.startswith('+'):
+                added_line_count += 1
+            else:
+                for prefix in (' ', '@@ ', 'diff ', 'index '):
+                    if line.startswith(prefix):
+                        break
+                else:
+                    raise ValueError(f'Unexpected prefix: {line}')
+            try:
+                line = next_line()
+            except StopIteration:
+                break
+        self._amendment_list.append({
+            'author': author,
+            'date': commit_date,
+            'message': '\r'.join(message_line_list),
+            'file_id_list': sorted(file_id_set),
+            'adds': added_line_count,
+            'subs': removed_line_count,
+            'diff': '\r'.join(patch),
+        })
+
+def _revision(value):
+    value = value.split('..')
+    if len(value) == 1:
+        return [int(value[0])]
+    start, stop = value
+    return range(int(start), int(stop) + 1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Work with repositories in the amend format',
+    )
+    parser.add_argument(
+        '--repository',
+        help='Name of the repository file to work on. '
+        'Default: *.repo file in the working directory',
+    )
+    parser.add_argument(
+        '--out-repository',
+        help='Name of the new repository file, if one gets written. '
+            'Default: same as --repository',
+    )
+    parser.add_argument(
+        '--encoding',
+        default='mac_roman',
+        help='Character encoding used in the repository file. '
+            'Default: %(default)s',
+    )
+    parser.add_argument(
+        '--out-encoding',
+        help='Character encoding to use when writing a new repository file. '
+            'Default: same as --encoding',
+    )
+    subparser = parser.add_subparsers(dest='command', required=True)
+
+    subparser.add_parser(
+        'init',
+        help='Create a new amend repository',
+    )
+
+    parser_clone = subparser.add_parser(
+        'clone',
+        help='Fetch an existing repository from amendhub',
+    )
+    parser_clone.add_argument(
+        'remote',
+        help='<user>/<repository> to fetch'
+    )
+
+    parser_log = subparser.add_parser('log', help='List amendments')
+    parser_log.add_argument(
+        'revision',
+        type=_revision,
+        nargs='?',
+        help='Revision or revision range. Default: all amendments',
+    )
+
+    parser_format_patch = subparser.add_parser(
+        'format-patch',
+        help='Export amendments into individual mailbox files',
+    )
+    parser_format_patch.add_argument(
+        'revision',
+        type=_revision,
+        nargs='?',
+        help='Revision or revision range. Default: latest amendment',
+    )
+
+    parser_am = subparser.add_parser(
+        'am',
+        help='Create amendments from individual mailbox-formated patches',
+    )
+    parser_am.add_argument(
+        '--author',
+        default=getpass.getuser(),
+        help='Replace non-remapped authors with this value. '
+            'Default: %(default)s',
+    )
+    parser_am.add_argument(
+        '--author-remap',
+        nargs=2,
+        metavar=('AUTHOR', 'AMEND-AUTHOR'),
+        action='append',
+        default=[],
+        help='Replace AUTHOR with AMEND-AUTHOR',
+    )
+    parser_am.add_argument(
+        '--type',
+        default='TEXT',
+        help='Default file type. Default: %(default)s',
+    )
+    parser_am.add_argument(
+        '--creator',
+        default='ttxt',
+        help='Default file creator. Default: %(default)s',
+    )
+    parser_am.add_argument('mailbox', nargs='*', help='Mailbox-formated patches')
+
+    args = parser.parse_args()
+
+    out_repository = args.out_repository
+    if out_repository is None:
+        out_repository = args.repository
+
+    out_encoding = args.out_encoding
+    if out_encoding is None:
+        out_encoding = args.encoding
+
+    def open_repository():
+        repository = args.repository
+        if repository is None:
+            repository_list = [
+                x
+                for x in os.listdir()
+                if x.endswith('.repo')
+            ]
+            if not repository_list:
+                parser.error('No *.repo file found')
+            try:
+                repository, = repository_list
+            except ValueError:
+                parser.error('More than one *.repo file found')
+        return Repo(repository, args.encoding), repository
+
+    command = args.command
+    if command == 'init':
+        Repo.init(
+            path=(
+                os.path.basename(
+                    os.path.realpath(os.path.curdir),
+                ) + '.repo'
+                if out_repository is None else
+                out_repository
+            ),
+            encoding=out_encoding,
+        )
+    elif command == 'clone':
+        try:
+            username, repository = args.remote.strip('/').split('/')
+        except ValueError:
+            parser.error('remote argument is not in the <user>/<repository> format')
+        Repo.clone_from(
+            url=f'https://amendhub.com/{username}/{repository}',
+            to_path=(
+                f'{repository}.repo'
+                if out_repository is None else
+                out_repository
+            ),
+            encoding=out_encoding,
+        )
+    elif command == 'log':
+        repo, _ = open_repository()
+        revision_list = args.revision
+        if revision_list is None:
+            revision_list = range(1, repo.get_amendment_count())
+        for index, revision in enumerate(revision_list):
+            try:
+                amendment = repo.get_amendment(revision)
+            except IndexError:
+                break
+            if index:
+                print()
+            print(f'amendment {revision}')
+            print(f'Author: {amendment['author']}')
+            # Because who likes email-style dates ?
+            print(f'Date:   {amendment['date'].isoformat(sep=' ')}')
+            print()
+            for line in amendment['message'].splitlines():
+                print(f'    {line}')
+    elif command == 'format-patch':
+        repo, _ = open_repository()
+        revision_list = args.revision
+        if revision_list is None:
+            revision_list = [repo.get_amendment_count() - 1]
+        for index, revision in enumerate(revision_list, 1):
+            outfile_name = f'{index:04d}.patch'
+            print(outfile_name)
+            with open(outfile_name, 'xb') as outfile:
+                outfile.write(repo.format_patch(revision))
+    elif command == 'am':
+        repo, repository = open_repository()
+        repo.am(
+            working_copy_path='.',
+            patch_filename_list=args.mailbox,
+            default_author=args.author,
+            author_dict=dict(args.author_remap),
+            default_file_type=args.type,
+            default_file_creator=args.creator,
+        )
+        repo.save(
+            save_as=(
+                repository
+                if out_repository is None else
+                out_repository
+            ),
+            encoding=out_encoding,
+        )
+    else:
+        raise ValueError(command)
+
+if __name__ == '__main__':
+    main()
