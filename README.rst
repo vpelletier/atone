@@ -12,4 +12,4 @@ Features
 - export amendments (similar to ``git format-patch``)
 - add amendments  (similar to ``git am``)
 
-.. _amends: https://amendhub.com/jcs/amend/
+.. _amends: https://amendhub.com/jcs/amend
